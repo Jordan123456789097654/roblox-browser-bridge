@@ -1,0 +1,16 @@
+{
+  "name": "roblox-browser-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Chromium pixel-tile streaming bridge for Roblox",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.11.0",
+    "sharp": "^0.33.5",
+    "ws": "^8.18.0"
+  }
+}
