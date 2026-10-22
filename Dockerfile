@@ -1,8 +1,6 @@
 FROM ghcr.io/puppeteer/puppeteer:23.11.0
 
-ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
-    NODE_ENV=production \
+ENV NODE_ENV=production \
     PORT=10000
 
 WORKDIR /home/pptruser/app
