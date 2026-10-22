@@ -28,7 +28,6 @@ const CFG = Object.freeze({
   maxTypeChars: 256,
   tilesPerChunk: 16,
 
-  // Outbox limits for frames waiting to be picked up by Roblox's /sync polls.
   outboxMaxMessages: 2000,
   outboxMaxBytes: 4 * 1024 * 1024,
   syncMaxBytes: 512 * 1024,
@@ -510,21 +509,21 @@ function readBody(req) {
   });
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(typeof obj === 'string' ? obj : JSON.stringify(obj));
+  res.end(body);
 }
 
 const httpServer = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
 
   if (req.method === 'GET' && u.pathname === '/health') {
-    return sendJson(res, 200, {
+    return sendJson(res, 200, JSON.stringify({
       ok: true,
       sessions: sessions.size,
       pendingMessages: outbox.length,
       lastSyncAgoMs: lastSyncAt ? Date.now() - lastSyncAt : null,
-    });
+    }));
   }
 
   if (req.method === 'POST' && u.pathname === '/sync') {
@@ -538,7 +537,50 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       body = JSON.parse(await readBody(req));
     } catch (err) {
-      return sendJson(res, err.status || 400, { error: 'bad request' });
+      return sendJson(res, err.status || 400, JSON.stringify({ error: 'bad request' }));
     }
 
-    const inputs = Array.isArray(body?.inputs) ? body.inputs.slice(0,
+    const inputs = Array.isArray(body?.inputs) ? body.inputs.slice(0, 200) : [];
+    for (const m of inputs) {
+      // Not awaited: navigation can take seconds and must not delay the sync response.
+      onBridgeMessage(m).catch((err) => log('input', err.message));
+    }
+
+    const msgs = drainOutbox();
+    return sendJson(res, 200, `{"messages":[${msgs.join(',')}]}`);
+  }
+
+  res.writeHead(404);
+  res.end();
+});
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+async function shutdown() {
+  log('shutting down');
+  for (const sid of [...sessions.keys()]) await destroySession(sid);
+  await browser?.close().catch(() => {});
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+
+async function main() {
+  if (!CFG.bridgeKey) throw new Error('BRIDGE_KEY environment variable is required');
+  browser = await launchBrowser();
+  browser.on('disconnected', () => {
+    log('browser disconnected; exiting so the host can restart');
+    process.exit(1);
+  });
+  setInterval(sweepIdle, 15_000).unref();
+  httpServer.listen(CFG.port, () => log(`listening on :${CFG.port}`));
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
