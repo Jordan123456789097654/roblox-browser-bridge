@@ -1,8 +1,8 @@
 {
   "name": "roblox-browser-bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Headless Chromium pixel-tile streaming bridge for Roblox",
+  "description": "Headless Chromium pixel-tile streaming bridge for Roblox (HTTP polling)",
   "main": "server.js",
   "engines": { "node": ">=20" },
   "scripts": {
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "puppeteer": "^23.11.0",
-    "sharp": "^0.33.5",
-    "ws": "^8.18.0"
+    "sharp": "^0.33.5"
   }
 }
