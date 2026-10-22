@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const puppeteer = require('puppeteer');
 const sharp = require('sharp');
-const { WebSocketServer } = require('ws');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -28,7 +27,11 @@ const CFG = Object.freeze({
   inputPerSec: 120,
   maxTypeChars: 256,
   tilesPerChunk: 16,
-  maxBridgeBuffer: 4 * 1024 * 1024,
+
+  // Outbox limits for frames waiting to be picked up by Roblox's /sync polls.
+  outboxMaxMessages: 2000,
+  outboxMaxBytes: 4 * 1024 * 1024,
+  syncMaxBytes: 512 * 1024,
 
   // Blocked hosts. Every http(s) URL is allowed unless its hostname matches one of these.
   // Loopback, private, and link-local addresses are always blocked (SSRF protection).
@@ -79,16 +82,16 @@ const LOCAL_SCHEMES = new Set(['data:', 'blob:', 'about:']);
 
 function isBlockedUrl(raw) {
   let u;
-  try { u = new URL(raw); } catch { return true; }   // unparseable input is blocked
+  try { u = new URL(raw); } catch { return true; }
   if (LOCAL_SCHEMES.has(u.protocol)) return false;
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return true;
-  const host = u.hostname.replace(/^\[|\]$/g, '');   // strip IPv6 brackets
+  const host = u.hostname.replace(/^\[|\]$/g, '');
   return CFG.blockedHosts.some((re) => re.test(host));
 }
 
 function keyOk(provided) {
   if (!provided || !CFG.bridgeKey) return false;
-  const a = Buffer.from(provided);
+  const a = Buffer.from(String(provided));
   const b = Buffer.from(CFG.bridgeKey);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
@@ -217,16 +220,35 @@ function enqueue(s, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge (Roblox server connects here)
+// Outbox (Roblox collects these via POST /sync)
 // ---------------------------------------------------------------------------
 
-let bridge = null;
+let outbox = [];
+let outboxBytes = 0;
+let lastSyncAt = 0;
 
 function sendToBridge(obj) {
-  if (!bridge || bridge.readyState !== 1) return false;
-  if (bridge.bufferedAmount > CFG.maxBridgeBuffer) return false;
-  bridge.send(JSON.stringify(obj));
+  const line = JSON.stringify(obj);
+  if (outbox.length >= CFG.outboxMaxMessages) return false;
+  if (outboxBytes + line.length > CFG.outboxMaxBytes) return false;
+  outbox.push(line);
+  outboxBytes += line.length;
   return true;
+}
+
+// Takes as many queued messages as fit under syncMaxBytes. Always takes at least one
+// so an oversized message can't block the queue forever.
+function drainOutbox() {
+  let size = 0;
+  let n = 0;
+  while (n < outbox.length && size + outbox[n].length <= CFG.syncMaxBytes) {
+    size += outbox[n].length;
+    n++;
+  }
+  if (n === 0 && outbox.length) n = 1;
+  const taken = outbox.splice(0, n);
+  for (const line of taken) outboxBytes -= line.length;
+  return taken;
 }
 
 function sendStatus(s, extra = {}) {
@@ -352,9 +374,7 @@ async function openSession(sid, url) {
   }
 }
 
-async function onBridgeMessage(raw) {
-  let msg;
-  try { msg = JSON.parse(raw.toString()); } catch { return; }
+async function onBridgeMessage(msg) {
   if (!msg || typeof msg.sid !== 'string' || typeof msg.t !== 'string') return;
 
   const sid = msg.sid.slice(0, 32);
@@ -467,68 +487,58 @@ async function runLoop(s) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP / WebSocket server
+// HTTP server
 // ---------------------------------------------------------------------------
 
-const httpServer = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, sessions: sessions.size, bridge: !!bridge }));
-  }
-  res.writeHead(404);
-  res.end();
-});
+const MAX_BODY_BYTES = 256 * 1024;
 
-const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('body too large'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
 
-httpServer.on('upgrade', (req, socket, head) => {
+function sendJson(res, status, obj) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(typeof obj === 'string' ? obj : JSON.stringify(obj));
+}
+
+const httpServer = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
-  if (u.pathname !== '/bridge' || !keyOk(u.searchParams.get('key'))) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    return socket.destroy();
+
+  if (req.method === 'GET' && u.pathname === '/health') {
+    return sendJson(res, 200, {
+      ok: true,
+      sessions: sessions.size,
+      pendingMessages: outbox.length,
+      lastSyncAgoMs: lastSyncAt ? Date.now() - lastSyncAt : null,
+    });
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-});
 
-wss.on('connection', (ws) => {
-  if (bridge && bridge !== ws) bridge.close(1000, 'replaced');
-  bridge = ws;
-  log('bridge connected');
-  ws.on('message', (raw) => { onBridgeMessage(raw); });
-  ws.on('close', () => {
-    if (bridge === ws) bridge = null;
-    log('bridge disconnected');
-  });
-  ws.on('error', (err) => log('bridge error', err.message));
-});
+  if (req.method === 'POST' && u.pathname === '/sync') {
+    if (!keyOk(req.headers['x-bridge-key'])) {
+      res.writeHead(401);
+      return res.end();
+    }
+    lastSyncAt = Date.now();
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
+    let body;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch (err) {
+      return sendJson(res, err.status || 400, { error: 'bad request' });
+    }
 
-async function shutdown() {
-  log('shutting down');
-  for (const sid of [...sessions.keys()]) await destroySession(sid);
-  await browser?.close().catch(() => {});
-  httpServer.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000).unref();
-}
-
-async function main() {
-  if (!CFG.bridgeKey) throw new Error('BRIDGE_KEY environment variable is required');
-  browser = await launchBrowser();
-  browser.on('disconnected', () => {
-    log('browser disconnected; exiting so the host can restart');
-    process.exit(1);
-  });
-  setInterval(sweepIdle, 15_000).unref();
-  httpServer.listen(CFG.port, () => log(`listening on :${CFG.port}`));
-}
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+    const inputs = Array.isArray(body?.inputs) ? body.inputs.slice(0,
