@@ -1,8 +1,9 @@
-# Official Puppeteer image includes Chrome and its system libraries.
 FROM ghcr.io/puppeteer/puppeteer:23.11.0
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    NODE_ENV=production
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+    NODE_ENV=production \
+    PORT=10000
 
 WORKDIR /home/pptruser/app
 
@@ -11,8 +12,6 @@ RUN npm install --omit=dev && npm cache clean --force
 
 COPY --chown=pptruser:pptruser server.js ./
 
-# Platforms set PORT; default matches server.js.
-ENV PORT=8080
-EXPOSE 8080
+EXPOSE 10000
 
 CMD ["node", "server.js"]
